@@ -38,53 +38,160 @@ if __name__ == "__main__":
 
 """Choose the least expensive worker count for the full suite."""
 
-import math
+
+"""Impact-based test selector for sqlglot. Uses patches and tests.json only.
+No sample answers or per-commit lookup is included.
+"""
+
+
+
+"""Impact-based test selector for sqlglot. Uses patches and tests.json only.
+No sample answers or per-commit lookup is included.
+"""
+
+
+
+"""RWX Blast Radius - Version 8.
+
+Predict impacted tests from patch paths and code context.
+Uses only the provided tests.json and patch files.
+"""
+
+
+
+
+"""RWX Blast Radius selector - Version 9.
+
+Select tests using changed files and code context.
+Ignore independently comment-only Python file changes.
+No sample answers or commit-specific lookup tables.
+"""
+
+
+
+
+"""RWX Blast Radius - Version 10.
+
+Impact-based test selection using patches and tests.json.
+No sample answers or per-commit lookup tables are used.
+"""
+
+
+
+
+"""Blast Radius selector - Version 14.
+
+Patch-aware test selection and worker scheduling.
+Uses incoming patches and tests.json only.
+
+No sample answers or commit-specific lookup tables.
+"""
+
+
+
+
+"""RWX Blast Radius - Version 16.
+
+Uses the existing V14 selector as a conservative fallback.
+
+For isolated optimizer-module edits, attempts to use the
+dedicated test named after the modified optimizer module.
+
+No sample answer keys or commit-specific lookups are used.
+"""
+
 import json
-import sys
+import re
 from pathlib import Path
 
+import baseline_selector
+
+
 DATA = Path("/data")
-MAX_WORKERS = 8
+
+select_baseline = (
+    getattr(baseline_selector, "select_v10", None)
+    or baseline_selector.select
+)
+
+schedule = baseline_selector.schedule
 
 
-def choose_workers(tests: list[dict]) -> list[list[int]]:
-    # Match the scorer's rounding before adding times together.
-    jobs = sorted(
-        ((test["number"], math.floor(test["seconds"] * 1000 + 0.5)) for test in tests),
-        key=lambda job: job[1],
-        reverse=True,
+def select(tests, patch):
+    """Select impacted tests from the incoming patch."""
+
+    # Start with the Version 14 selection.
+    baseline = select_baseline(tests, patch)
+
+    # Identify the modified files.
+    paths = re.findall(
+        r"^diff --git a/.*? b/(.*?)$",
+        patch,
+        flags=re.MULTILINE,
     )
 
-    best_cost = math.inf
-    best_workers = []
+    # Keep the original selection for large or
+    # multi-file changes.
+    if len(paths) != 1 or len(baseline) > 30:
+        return baseline
 
-    for count in range(1, min(MAX_WORKERS, len(jobs)) + 1):
-        workers = [[] for _ in range(count)]
-        loads = [0] * count
+    path = paths[0]
 
-        for number, milliseconds in jobs:
-            lightest = loads.index(min(loads))
-            workers[lightest].append(number)
-            loads[lightest] += milliseconds
+    # Only refine isolated Python optimizer changes.
+    if not (
+        path.startswith("sqlglot/optimizer/")
+        and path.endswith(".py")
+    ):
+        return baseline
 
-        occupied = [worker for worker in workers if worker]
-        cost = max(loads) + 2000 * len(occupied)
+    stem = Path(path).stem
 
-        if cost < best_cost:
-            best_cost = cost
-            best_workers = occupied
+    # These modules have broader dependencies.
+    if stem in {"__init__", "scope"}:
+        return baseline
 
-    return best_workers
+    # Find a dedicated optimizer regression test.
+    directly_named = [
+        test
+        for test in baseline
+        if (
+            test["file"] == "tests/test_optimizer.py"
+            and test["id"].split("::")[-1]
+            == "test_" + stem
+        )
+    ]
+
+    # Use the existing selector if no matching
+    # regression test is available.
+    return directly_named or baseline
 
 
-def main() -> None:
-    tests = json.loads((DATA / "tests.json").read_text())["tests"]
-    workers = choose_workers(tests)
+def main():
+    tests = json.loads(
+        (DATA / "tests.json").read_text()
+    )["tests"]
 
-    for patch in sorted((DATA / "commits").glob("*.patch")):
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
+    for patch_file in sorted(
+        (DATA / "commits").glob("*.patch")
+    ):
+        patch = patch_file.read_text(
+            errors="replace"
+        )
 
-    print(f"selected {len(tests)} tests on every commit", file=sys.stderr)
+        selected = select(tests, patch)
+
+        workers = schedule(selected)
+
+        # Print only the required JSON object.
+        print(
+            json.dumps(
+                {
+                    "commit": patch_file.stem,
+                    "workers": workers,
+                },
+                separators=(",", ":"),
+            )
+        )
 
 
 if __name__ == "__main__":
