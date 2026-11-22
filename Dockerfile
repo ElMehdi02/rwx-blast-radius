@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir \
     -r /app/requirements.lock && \
     pip install --no-cache-dir pytest-cov==7.0.0
 
-COPY selector.py previous_v17.py previous_selector.py baseline_selector.py build_index.py build_dependencies.py /app/
+COPY selector.py previous_v20.py previous_v17.py previous_selector.py baseline_selector.py build_index.py build_dependencies.py /app/
 
 WORKDIR /opt/sqlglot
 
@@ -26,8 +26,8 @@ ENV PYTHONPATH=/app:/opt/sqlglot
 ENV SKIP_INTEGRATION=0
 ENV COVERAGE_FILE=/app/.coverage
 ENV COVERAGE_CORE=ctrace
+ENV BLAST_MODE=balanced
 
-# Generate test coverage during Docker build.
 RUN timeout 300s python -m pytest -q \
     --cov=sqlglot \
     --cov-context=test \
@@ -39,7 +39,6 @@ RUN timeout 300s python -m pytest -q \
     tests/test_serde.py \
     tests/dialects || true
 
-# Generate both impact indexes.
 RUN python /app/build_index.py && \
     python /app/build_dependencies.py
 

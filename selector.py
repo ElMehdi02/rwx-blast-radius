@@ -1,245 +1,503 @@
 
-"""RWX Blast Radius - Version 20.
+"""Blast Radius V23: conservative test-impact selection.
 
-Experimental dependency-aware test selector.
+This selector prioritizes detecting failures on unseen commits.
+It does not consult answer files or known commit IDs.
 
-Combines:
-- Version 17 fallback
-- Function-level test coverage
-- Static reverse-call dependencies
-- Cost-aware worker scheduling
-
-No sample answers or commit-specific failure tables.
+BLAST_MODE=balanced: existing impact selector plus regression tests.
+BLAST_MODE=safe: select every test from tests.json.
 """
 
 import json
+import os
 import re
-from collections import deque
 from pathlib import Path
 
-import previous_v17
-
-
 DATA = Path("/data")
-INDEX = Path("/app/impact_index.json")
-EDGES = Path("/app/dependencies.json")
+MODE = os.environ.get(
+    "BLAST_MODE", "balanced"
+).strip().lower()
+
+MAX_WORKERS = 8
+OVERHEAD_MS = 2000
+
+try:
+    import previous_v17
+    import previous_v20
+except ImportError:
+    previous_v17 = None
+    previous_v20 = None
 
 
-def read_json(path):
+def load_json(path, default):
     try:
         return json.loads(
             path.read_text(encoding="utf-8")
         )
     except (OSError, ValueError):
-        return {}
+        return default
 
 
-def changed_old_lines(patch):
-    changed = {}
-    old_name = None
-    old_line = None
-
-    for row in patch.splitlines():
-
-        if row.startswith("diff --git "):
-            match = re.match(
-                r"^diff --git a/(.*?) b/(.*)$",
-                row,
+def files_in_patch(patch):
+    return sorted(
+        set(
+            re.findall(
+                r"^diff --git a/(.*?) b/[^\n]+",
+                patch,
+                re.M,
             )
-
-            old_name = (
-                match.group(1) if match else None
-            )
-            old_line = None
-
-        elif row.startswith("@@ "):
-            match = re.match(
-                r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@",
-                row,
-            )
-
-            old_line = (
-                int(match.group(1))
-                if match else None
-            )
-
-        elif old_name and old_line is not None:
-
-            if row.startswith(" "):
-                old_line += 1
-
-            elif (
-                row.startswith("-")
-                and not row.startswith("---")
-            ):
-                changed.setdefault(
-                    old_name, set()
-                ).add(old_line)
-
-                old_line += 1
-
-            elif (
-                row.startswith("+")
-                and not row.startswith("+++")
-            ):
-                changed.setdefault(
-                    old_name, set()
-                ).add(max(1, old_line - 1))
-
-    return changed
-
-
-def module_for(path):
-    return ".".join(
-        Path(path).with_suffix("").parts
-    ).removesuffix(".__init__")
-
-
-def impacted(tests, patch, baseline, index, reverse):
-    changes = changed_old_lines(patch)
-
-    if (
-        len(changes) != 1
-        or not index
-        or not reverse
-        or not baseline
-    ):
-        return baseline
-
-    path, lines = next(iter(changes.items()))
-
-    if not (
-        path.startswith("sqlglot/")
-        and path.endswith(".py")
-        and lines
-    ):
-        return baseline
-
-    # Keep broad test selection for shared modules.
-    if (
-        path.startswith("sqlglot/optimizer/")
-        or path.startswith("sqlglot/expressions/")
-        or path in {
-            "sqlglot/serde.py",
-            "sqlglot/parser.py",
-            "sqlglot/generator.py",
-            "sqlglot/dialects/dialect.py",
-        }
-    ):
-        return baseline
-
-    entries = index.get(path)
-
-    if not entries:
-        return baseline
-
-    affected = [
-        entry
-        for entry in entries
-        if any(
-            entry[1] <= line <= entry[2]
-            for line in lines
         )
-    ]
-
-    if not affected:
-        return baseline
-
-    # If some edits are outside mapped functions,
-    # the full impact is uncertain.
-    for line in lines:
-        if not any(
-            entry[1] <= line <= entry[2]
-            for entry in affected
-        ):
-            return baseline
-
-    module = module_for(path)
-
-    frontier = deque(
-        module + ":" + entry[0]
-        for entry in affected
     )
 
-    visited = set()
 
-    # Follow reverse dependencies.
-    while frontier:
-        key = frontier.popleft()
+def classify(paths):
+    """Classify dependencies using changed file paths."""
+    core = False
+    optimizer = False
+    parser = False
+    generator = False
+    executor = False
+    serde = False
 
-        if key in visited:
+    dialects = set()
+    fixture_names = set()
+
+    for p in paths:
+        if p.startswith(
+            (
+                "sqlglot/dialects/",
+                "sqlglot/parsers/",
+                "sqlglot/generators/",
+                "sqlglot/typing/",
+            )
+        ):
+            name = Path(p).stem
+
+            if name not in (
+                "__init__",
+                "dialect",
+                "parser",
+                "generator",
+            ):
+                dialects.add(name)
+
+        if p.startswith("tests/dialects/"):
+            name = Path(p).stem.removeprefix(
+                "test_"
+            )
+
+            if name not in (
+                "dialect",
+                "__init__",
+            ):
+                dialects.add(name)
+
+        if p.startswith(
+            "tests/fixtures/optimizer/"
+        ):
+            fixture_names.add(
+                Path(p).stem.split("__", 1)[0]
+            )
+            optimizer = True
+
+        if p.startswith(
+            "sqlglot/optimizer/"
+        ):
+            optimizer = True
+
+        if p.startswith(
+            "sqlglot/executor/"
+        ):
+            executor = True
+
+        if p == "sqlglot/serde.py":
+            serde = True
+
+        if (
+            p.startswith("sqlglot/parsers/")
+            or p in (
+                "sqlglot/parser.py",
+                "sqlglot/tokens.py",
+                "sqlglot/tokenizer.py",
+            )
+        ):
+            parser = True
+
+        if (
+            p.startswith("sqlglot/generators/")
+            or p in (
+                "sqlglot/generator.py",
+                "sqlglot/transforms.py",
+            )
+        ):
+            generator = True
+
+        if (
+            p.startswith(
+                "sqlglot/expressions/"
+            )
+            or p in (
+                "sqlglot/expressions.py",
+                "sqlglot/exp.py",
+            )
+        ):
+            core = True
+
+        if p in (
+            "sqlglot/dialects/dialect.py",
+            "sqlglot/__init__.py",
+            "sqlglot/helper.py",
+            "sqlglot/schema.py",
+        ):
+            core = True
+
+        if p.startswith("sqlglot/typing/"):
+            optimizer = True
+
+    return (
+        core,
+        optimizer,
+        parser,
+        generator,
+        executor,
+        serde,
+        dialects,
+        fixture_names,
+    )
+
+
+def initial_select(tests, patch, index, reverse):
+    """Use Version 20 selection when available."""
+
+    if (
+        previous_v17 is not None
+        and previous_v20 is not None
+    ):
+        base = previous_v17.select(
+            tests, patch
+        )
+
+        candidate = previous_v20.impacted(
+            tests,
+            patch,
+            base,
+            index,
+            reverse,
+        )
+
+        return candidate or base
+
+    paths = files_in_patch(patch)
+    direct = []
+
+    for test in tests:
+        file = test["file"]
+
+        if any(file == p for p in paths):
+            direct.append(test)
             continue
 
-        visited.add(key)
+        if any(
+            p.startswith(
+                "sqlglot/dialects/"
+            )
+            and file
+            == "tests/dialects/test_"
+            + Path(p).stem
+            + ".py"
+            for p in paths
+        ):
+            direct.append(test)
 
-        # Large dependency networks are uncertain.
-        if len(visited) > 100:
-            return baseline
+    return direct
 
-        for caller in reverse.get(key, ()):
-            if caller not in visited:
-                frontier.append(caller)
 
-    # Index all functions and their covered tests.
-    all_functions = {}
+def select(tests, patch, index, reverse):
+    """Select tests using impact analysis and safety rules."""
 
-    for source_path, functions in index.items():
-        source_module = module_for(source_path)
+    if MODE == "safe":
+        return tests
 
-        for entry in functions:
-            all_functions[
-                source_module + ":" + entry[0]
-            ] = entry[3]
+    paths = files_in_patch(patch)
 
-    covered_ids = set()
+    if not paths:
+        return tests
 
-    for key in visited:
-        contexts = all_functions.get(key)
-
-        if not contexts:
-            # Missing information: keep the baseline.
-            return baseline
-
-        covered_ids.update(contexts)
-
-    # Preserve dedicated dialect regression tests.
-    dialect_test_file = (
-        "tests/dialects/test_"
-        + Path(path).stem
-        + ".py"
+    base = initial_select(
+        tests,
+        patch,
+        index,
+        reverse,
     )
 
-    keep = {
+    selected = {
         test["number"]
-        for test in baseline
-        if (
-            test["id"] in covered_ids
-            or test["file"] == dialect_test_file
-        )
+        for test in base
     }
 
-    narrowed = [
-        test
-        for test in baseline
-        if test["number"] in keep
-    ]
+    (
+        core,
+        opt,
+        par,
+        gen,
+        exe,
+        serde,
+        dialects,
+        fixtures,
+    ) = classify(paths)
 
-    # Avoid poorly supported or negligible reductions.
-    if (
-        len(narrowed) < 3
-        or len(narrowed) >= len(baseline)
-    ):
-        return baseline
-
-    time_saved = (
-        sum(t["seconds"] for t in baseline)
-        - sum(t["seconds"] for t in narrowed)
+    actual_optimizer = any(
+        p.startswith(
+            (
+                "sqlglot/optimizer/",
+                "sqlglot/typing/",
+            )
+        )
+        for p in paths
     )
 
-    if time_saved < 1.0:
-        return baseline
+    shared_parser = (
+        core
+        or any(
+            p in (
+                "sqlglot/parser.py",
+                "sqlglot/tokens.py",
+                "sqlglot/tokenizer.py",
+            )
+            for p in paths
+        )
+    )
 
-    return narrowed
+    # Run inexpensive regression tests.
+    # Hidden missed failures cost 300 seconds each.
+    cheap_limit = (
+        0.20
+        if (
+            core
+            or opt
+            or par
+            or exe
+            or serde
+        )
+        else 0.10
+    )
+
+    direct_dialect_files = {
+        "tests/dialects/test_"
+        + name
+        + ".py"
+        for name in dialects
+    }
+
+    for test in tests:
+        number = test["number"]
+        file = test["file"]
+        test_id = test["id"]
+        seconds = float(
+            test["seconds"]
+        )
+
+        # Low-cost regression safety net.
+        if seconds <= cheap_limit:
+            selected.add(number)
+
+        # Optimizer and shared-function regression tests.
+        if (
+            opt
+            or exe
+            or serde
+            or core
+        ):
+            if file in (
+                "tests/test_optimizer.py",
+                "tests/test_serde.py",
+                "tests/test_lineage.py",
+                "tests/test_schema.py",
+                "tests/test_expressions.py",
+            ):
+                selected.add(number)
+
+        # Parser and generator tests.
+        if (
+            par
+            or gen
+            or core
+        ):
+            if file in (
+                "tests/test_parser.py",
+                "tests/test_generator.py",
+                "tests/test_transpile.py",
+                "tests/test_expressions.py",
+            ):
+                if not (
+                    file == "tests/test_parser.py"
+                    and seconds > 10
+                    and not shared_parser
+                ):
+                    selected.add(number)
+
+        # Dedicated dialect tests.
+        if dialects:
+            if file in direct_dialect_files:
+                selected.add(number)
+
+            if (
+                file
+                == "tests/dialects/test_dialect.py"
+                and seconds <= 0.5
+            ):
+                selected.add(number)
+
+        # Cross-dialect optimizer checks.
+        if (
+            dialects
+            and file == "tests/test_optimizer.py"
+        ):
+            selected.add(number)
+
+        # Optimizer fixture-specific tests.
+        if (
+            fixtures
+            and file == "tests/test_optimizer.py"
+        ):
+            if any(
+                "test_" + name in test_id
+                for name in fixtures
+            ):
+                selected.add(number)
+
+        # Parser changes can affect optimization.
+        if (
+            par
+            and dialects
+            and file == "tests/test_optimizer.py"
+            and seconds <= 2.0
+        ):
+            selected.add(number)
+
+        # Protect executor integration tests.
+        if (
+            actual_optimizer
+            or exe
+            or serde
+            or core
+        ):
+            if file == "tests/test_executor.py":
+                selected.add(number)
+
+    return [
+        test
+        for test in tests
+        if test["number"] in selected
+    ]
+
+
+def schedule(selected):
+    """Balance tests across up to eight workers."""
+
+    if not selected:
+        return []
+
+    durations = {
+        int(test["number"]): int(
+            round(
+                float(test["seconds"]) * 1000
+            )
+        )
+        for test in selected
+    }
+
+    ordered = sorted(
+        durations,
+        key=lambda number: (
+            -durations[number],
+            number,
+        ),
+    )
+
+    total = sum(
+        durations.values()
+    )
+
+    longest = durations[
+        ordered[0]
+    ]
+
+    best = None
+    best_cost = float("inf")
+
+    max_count = min(
+        MAX_WORKERS,
+        len(ordered),
+    )
+
+    for workers_count in range(
+        1,
+        max_count + 1,
+    ):
+        lower_bound = max(
+            longest,
+            (
+                total
+                + workers_count
+                - 1
+            ) // workers_count,
+        )
+
+        lower_bound += (
+            OVERHEAD_MS
+            * workers_count
+        )
+
+        if lower_bound >= best_cost:
+            continue
+
+        groups = [
+            []
+            for _ in range(
+                workers_count
+            )
+        ]
+
+        loads = [
+            0
+            for _ in range(
+                workers_count
+            )
+        ]
+
+        for number in ordered:
+            worker = min(
+                range(workers_count),
+                key=lambda i: (
+                    loads[i],
+                    i,
+                ),
+            )
+
+            groups[worker].append(
+                number
+            )
+
+            loads[worker] += (
+                durations[number]
+            )
+
+        cost = (
+            max(loads)
+            + workers_count
+            * OVERHEAD_MS
+        )
+
+        if cost < best_cost:
+            best_cost = cost
+            best = groups
+
+    return (
+        best
+        if best is not None
+        else [ordered]
+    )
 
 
 def main():
@@ -249,43 +507,48 @@ def main():
         )
     )["tests"]
 
-    index = read_json(INDEX)
-    reverse = read_json(EDGES)
+    index = load_json(
+        Path("/app/impact_index.json"),
+        {},
+    )
 
-    for filename in sorted(
-        (DATA / "commits").glob("*.patch")
-    ):
-        patch = filename.read_text(
+    reverse = load_json(
+        Path("/app/dependencies.json"),
+        {},
+    )
+
+    patch_files = sorted(
+        (DATA / "commits").glob(
+            "*.patch"
+        )
+    )
+
+    for patch_file in patch_files:
+        patch = patch_file.read_text(
             encoding="utf-8",
             errors="replace",
         )
 
-        baseline = previous_v17.select(
-            tests, patch
-        )
-
-        chosen = impacted(
+        selection = select(
             tests,
             patch,
-            baseline,
             index,
             reverse,
         )
 
-        workers = (
-            previous_v17.previous_selector.schedule(
-                chosen
-            )
+        workers = schedule(
+            selection
         )
 
         print(
             json.dumps(
                 {
-                    "commit": filename.stem,
+                    "commit": patch_file.stem,
                     "workers": workers,
                 },
                 separators=(",", ":"),
-            )
+            ),
+            flush=True,
         )
 
 
