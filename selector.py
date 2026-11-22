@@ -1,192 +1,287 @@
-"""The starter selector: run every test on every commit, spread over 3 workers.
 
-It never misses a failing test and it is slow. Everything you do from here
-is deciding which tests a change cannot break.
-"""
-"""
-import json
-import sys
-from pathlib import Path
+"""RWX Blast Radius - Version 20.
 
-DATA = Path("/data")
-WORKERS = 3
+Experimental dependency-aware test selector.
 
+Combines:
+- Version 17 fallback
+- Function-level test coverage
+- Static reverse-call dependencies
+- Cost-aware worker scheduling
 
-def split(tests: list[dict], worker_count: int) -> list[list[int]]:
-   """ """Longest test first, each onto the worker with the least to do so far.""""""
-    workers: list[list[int]] = [[] for _ in range(worker_count)]
-    loads = [0.0] * worker_count
-    for test in sorted(tests, key=lambda test: test["seconds"], reverse=True):
-        lightest = loads.index(min(loads))
-        workers[lightest].append(test["number"])
-        loads[lightest] += test["seconds"]
-    return workers
-
-
-def main() -> None:
-    tests = json.loads((DATA / "tests.json").read_text())["tests"]
-    workers = split(tests, WORKERS)
-    for patch in sorted((DATA / "commits").glob("*.patch")):
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
-    print(f"selected {len(tests)} tests on every commit", file=sys.stderr)
-
-
-if __name__ == "__main__":
-    main()
-"""
-
-
-"""Choose the least expensive worker count for the full suite."""
-
-
-"""Impact-based test selector for sqlglot. Uses patches and tests.json only.
-No sample answers or per-commit lookup is included.
-"""
-
-
-
-"""Impact-based test selector for sqlglot. Uses patches and tests.json only.
-No sample answers or per-commit lookup is included.
-"""
-
-
-
-"""RWX Blast Radius - Version 8.
-
-Predict impacted tests from patch paths and code context.
-Uses only the provided tests.json and patch files.
-"""
-
-
-
-
-"""RWX Blast Radius selector - Version 9.
-
-Select tests using changed files and code context.
-Ignore independently comment-only Python file changes.
-No sample answers or commit-specific lookup tables.
-"""
-
-
-
-
-"""RWX Blast Radius - Version 10.
-
-Impact-based test selection using patches and tests.json.
-No sample answers or per-commit lookup tables are used.
-"""
-
-
-
-
-"""Blast Radius selector - Version 14.
-
-Patch-aware test selection and worker scheduling.
-Uses incoming patches and tests.json only.
-
-No sample answers or commit-specific lookup tables.
-"""
-
-
-
-
-"""RWX Blast Radius - Version 16.
-
-Uses the existing V14 selector as a conservative fallback.
-
-For isolated optimizer-module edits, attempts to use the
-dedicated test named after the modified optimizer module.
-
-No sample answer keys or commit-specific lookups are used.
+No sample answers or commit-specific failure tables.
 """
 
 import json
 import re
+from collections import deque
 from pathlib import Path
 
-import baseline_selector
+import previous_v17
 
 
 DATA = Path("/data")
-
-select_baseline = (
-    getattr(baseline_selector, "select_v10", None)
-    or baseline_selector.select
-)
-
-schedule = baseline_selector.schedule
+INDEX = Path("/app/impact_index.json")
+EDGES = Path("/app/dependencies.json")
 
 
-def select(tests, patch):
-    """Select impacted tests from the incoming patch."""
+def read_json(path):
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return {}
 
-    # Start with the Version 14 selection.
-    baseline = select_baseline(tests, patch)
 
-    # Identify the modified files.
-    paths = re.findall(
-        r"^diff --git a/.*? b/(.*?)$",
-        patch,
-        flags=re.MULTILINE,
-    )
+def changed_old_lines(patch):
+    changed = {}
+    old_name = None
+    old_line = None
 
-    # Keep the original selection for large or
-    # multi-file changes.
-    if len(paths) != 1 or len(baseline) > 30:
-        return baseline
+    for row in patch.splitlines():
 
-    path = paths[0]
+        if row.startswith("diff --git "):
+            match = re.match(
+                r"^diff --git a/(.*?) b/(.*)$",
+                row,
+            )
 
-    # Only refine isolated Python optimizer changes.
-    if not (
-        path.startswith("sqlglot/optimizer/")
-        and path.endswith(".py")
+            old_name = (
+                match.group(1) if match else None
+            )
+            old_line = None
+
+        elif row.startswith("@@ "):
+            match = re.match(
+                r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@",
+                row,
+            )
+
+            old_line = (
+                int(match.group(1))
+                if match else None
+            )
+
+        elif old_name and old_line is not None:
+
+            if row.startswith(" "):
+                old_line += 1
+
+            elif (
+                row.startswith("-")
+                and not row.startswith("---")
+            ):
+                changed.setdefault(
+                    old_name, set()
+                ).add(old_line)
+
+                old_line += 1
+
+            elif (
+                row.startswith("+")
+                and not row.startswith("+++")
+            ):
+                changed.setdefault(
+                    old_name, set()
+                ).add(max(1, old_line - 1))
+
+    return changed
+
+
+def module_for(path):
+    return ".".join(
+        Path(path).with_suffix("").parts
+    ).removesuffix(".__init__")
+
+
+def impacted(tests, patch, baseline, index, reverse):
+    changes = changed_old_lines(patch)
+
+    if (
+        len(changes) != 1
+        or not index
+        or not reverse
+        or not baseline
     ):
         return baseline
 
-    stem = Path(path).stem
+    path, lines = next(iter(changes.items()))
 
-    # These modules have broader dependencies.
-    if stem in {"__init__", "scope"}:
+    if not (
+        path.startswith("sqlglot/")
+        and path.endswith(".py")
+        and lines
+    ):
         return baseline
 
-    # Find a dedicated optimizer regression test.
-    directly_named = [
-        test
-        for test in baseline
-        if (
-            test["file"] == "tests/test_optimizer.py"
-            and test["id"].split("::")[-1]
-            == "test_" + stem
+    # Keep broad test selection for shared modules.
+    if (
+        path.startswith("sqlglot/optimizer/")
+        or path.startswith("sqlglot/expressions/")
+        or path in {
+            "sqlglot/serde.py",
+            "sqlglot/parser.py",
+            "sqlglot/generator.py",
+            "sqlglot/dialects/dialect.py",
+        }
+    ):
+        return baseline
+
+    entries = index.get(path)
+
+    if not entries:
+        return baseline
+
+    affected = [
+        entry
+        for entry in entries
+        if any(
+            entry[1] <= line <= entry[2]
+            for line in lines
         )
     ]
 
-    # Use the existing selector if no matching
-    # regression test is available.
-    return directly_named or baseline
+    if not affected:
+        return baseline
+
+    # If some edits are outside mapped functions,
+    # the full impact is uncertain.
+    for line in lines:
+        if not any(
+            entry[1] <= line <= entry[2]
+            for entry in affected
+        ):
+            return baseline
+
+    module = module_for(path)
+
+    frontier = deque(
+        module + ":" + entry[0]
+        for entry in affected
+    )
+
+    visited = set()
+
+    # Follow reverse dependencies.
+    while frontier:
+        key = frontier.popleft()
+
+        if key in visited:
+            continue
+
+        visited.add(key)
+
+        # Large dependency networks are uncertain.
+        if len(visited) > 100:
+            return baseline
+
+        for caller in reverse.get(key, ()):
+            if caller not in visited:
+                frontier.append(caller)
+
+    # Index all functions and their covered tests.
+    all_functions = {}
+
+    for source_path, functions in index.items():
+        source_module = module_for(source_path)
+
+        for entry in functions:
+            all_functions[
+                source_module + ":" + entry[0]
+            ] = entry[3]
+
+    covered_ids = set()
+
+    for key in visited:
+        contexts = all_functions.get(key)
+
+        if not contexts:
+            # Missing information: keep the baseline.
+            return baseline
+
+        covered_ids.update(contexts)
+
+    # Preserve dedicated dialect regression tests.
+    dialect_test_file = (
+        "tests/dialects/test_"
+        + Path(path).stem
+        + ".py"
+    )
+
+    keep = {
+        test["number"]
+        for test in baseline
+        if (
+            test["id"] in covered_ids
+            or test["file"] == dialect_test_file
+        )
+    }
+
+    narrowed = [
+        test
+        for test in baseline
+        if test["number"] in keep
+    ]
+
+    # Avoid poorly supported or negligible reductions.
+    if (
+        len(narrowed) < 3
+        or len(narrowed) >= len(baseline)
+    ):
+        return baseline
+
+    time_saved = (
+        sum(t["seconds"] for t in baseline)
+        - sum(t["seconds"] for t in narrowed)
+    )
+
+    if time_saved < 1.0:
+        return baseline
+
+    return narrowed
 
 
 def main():
     tests = json.loads(
-        (DATA / "tests.json").read_text()
+        (DATA / "tests.json").read_text(
+            encoding="utf-8"
+        )
     )["tests"]
 
-    for patch_file in sorted(
+    index = read_json(INDEX)
+    reverse = read_json(EDGES)
+
+    for filename in sorted(
         (DATA / "commits").glob("*.patch")
     ):
-        patch = patch_file.read_text(
-            errors="replace"
+        patch = filename.read_text(
+            encoding="utf-8",
+            errors="replace",
         )
 
-        selected = select(tests, patch)
+        baseline = previous_v17.select(
+            tests, patch
+        )
 
-        workers = schedule(selected)
+        chosen = impacted(
+            tests,
+            patch,
+            baseline,
+            index,
+            reverse,
+        )
 
-        # Print only the required JSON object.
+        workers = (
+            previous_v17.previous_selector.schedule(
+                chosen
+            )
+        )
+
         print(
             json.dumps(
                 {
-                    "commit": patch_file.stem,
+                    "commit": filename.stem,
                     "workers": workers,
                 },
                 separators=(",", ":"),
