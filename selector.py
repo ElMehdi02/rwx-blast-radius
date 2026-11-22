@@ -1,4 +1,3 @@
-
 """Blast Radius V25 experimental: structural test-family selection.
 No commit IDs, sample answer data, or failure lookup tables are used.
 """
